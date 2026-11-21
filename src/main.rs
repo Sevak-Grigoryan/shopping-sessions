@@ -5,7 +5,6 @@
 mod pq;
 mod scan;
 use memchr::memchr;
-use memmap2::Mmap;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::fs::File;
@@ -119,15 +118,26 @@ fn bucket(h: u64) -> usize {
 }
 
 // ---------------------------------------------------------------- files
+/// A small whole file, read into memory that lives until exit.
 fn load(path: &Path) -> S {
-    let f = File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if len == 0 {
-        return &[];
+    Box::leak(std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}")).into_boxed_slice())
+}
+
+#[cfg(unix)]
+fn read_at(f: &File, buf: &mut [u8], off: u64) {
+    use std::os::unix::fs::FileExt;
+    f.read_exact_at(buf, off).expect("read");
+}
+#[cfg(windows)]
+fn read_at(f: &File, buf: &mut [u8], mut off: u64) {
+    use std::os::windows::fs::FileExt;
+    let mut done = 0;
+    while done < buf.len() {
+        let n = f.seek_read(&mut buf[done..], off).expect("read");
+        assert!(n > 0, "short read");
+        done += n;
+        off += n as u64;
     }
-    let m = unsafe { memmap2::MmapOptions::new().populate().map(&f) }.expect("mmap");
-    let m: &'static Mmap = Box::leak(Box::new(m));
-    &m[..]
 }
 
 fn list_csv(dir: &Path) -> Vec<PathBuf> {
@@ -143,30 +153,97 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// A byte range [s, e) of one input file, read on demand by the task that parses it, so reading
+/// is spread over all threads (many requests in flight) and overlaps with parsing. The chunk
+/// owns every line that starts inside its range.
+struct Range {
+    file: usize,
+    s: u64,
+    e: u64,
+    len: u64, // file length
+    skip_header: bool,
+}
+impl Range {
+    #[inline]
+    fn size(&self) -> usize {
+        (self.e - self.s) as usize
+    }
+    /// Reads the lines this chunk owns into memory that lives until exit.
+    fn fetch(&self, files: &[File]) -> S {
+        const OVER: u64 = 64 << 10; // read past e to finish the last line
+        let start = self.s.saturating_sub(1); // byte s-1 tells whether a line starts at s
+        let mut want = (self.e + OVER).min(self.len);
+        loop {
+            let n = (want - start) as usize;
+            let mut buf: Vec<u8> = Vec::with_capacity(n);
+            unsafe { buf.set_len(n) };
+            read_at(&files[self.file], &mut buf, start);
+            // first line start
+            let first = if self.s == 0 {
+                Some(0)
+            } else {
+                memchr(b'\n', &buf).map(|p| p + 1)
+            };
+            let first = match first {
+                Some(p) => p,
+                None if want == self.len => return &[],
+                None => {
+                    want = (want + 16 * OVER).min(self.len);
+                    continue;
+                }
+            };
+            if start + first as u64 >= self.e {
+                return &[]; // no line starts in this chunk
+            }
+            // end: just past the first '\n' at or after byte e-1
+            let end = if self.e == self.len {
+                n
+            } else {
+                let from = (self.e - 1 - start) as usize;
+                match memchr(b'\n', &buf[from..]) {
+                    Some(p) => from + p + 1,
+                    None if want == self.len => n,
+                    None => {
+                        want = (want + 16 * OVER).min(self.len);
+                        continue;
+                    }
+                }
+            };
+            let buf: &'static [u8] = Box::leak(buf.into_boxed_slice());
+            return &buf[first..end];
+        }
+    }
+}
+
 struct Chunk {
     data: S,
     skip_header: bool,
 }
 
-fn make_chunks(files: &[S]) -> Vec<Chunk> {
+/// Reads all CSV files of a folder as chunks of about CHUNK bytes, each chunk read by its own
+/// task (so one big file is read by all threads at once), biggest chunks first.
+fn read_chunks(dir: &Path) -> Vec<Chunk> {
+    let (files, ranges) = plan_chunks(&list_csv(dir));
+    ranges.par_iter().map(|r| Chunk { data: r.fetch(&files), skip_header: r.skip_header }).collect()
+}
+
+/// Opens the files and cuts them into ranges of about CHUNK bytes.
+fn plan_chunks(paths: &[PathBuf]) -> (Vec<File>, Vec<Range>) {
+    let files: Vec<File> =
+        paths.iter().map(|p| File::open(p).unwrap_or_else(|e| panic!("open {p:?}: {e}"))).collect();
     let mut out = Vec::new();
-    for &d in files {
-        let mut pos = 0;
-        while pos < d.len() {
-            let mut end = (pos + CHUNK).min(d.len());
-            if end < d.len() {
-                end = match memchr(b'\n', &d[end..]) {
-                    Some(i) => end + i + 1,
-                    None => d.len(),
-                };
-            }
-            out.push(Chunk { data: &d[pos..end], skip_header: pos == 0 });
-            pos = end;
+    for (i, f) in files.iter().enumerate() {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut s = 0u64;
+        while s < len {
+            let e = (s + CHUNK as u64).min(len);
+            out.push(Range { file: i, s, e, len, skip_header: s == 0 });
+            s = e;
         }
     }
     // big chunks first for better load balance
-    out.sort_by(|a, b| b.data.len().cmp(&a.data.len()));
-    out
+    out.sort_by(|a, b| b.size().cmp(&a.size()));
+    (files, out)
 }
 
 /// Reads a small whole file (header skipped) into rows of N fields.
@@ -583,8 +660,7 @@ impl LinkMap {
 /// larger root under the smaller). Every linked ID then gets its person: the key of the
 /// byte-wise smallest ID of its component. Also returns the names of persons whose key is a hash.
 fn build_links(dir: &Path) -> (LinkMap, Vec<(u64, u64)>) {
-    let files: Vec<S> = list_csv(dir).par_iter().map(|p| load(p)).collect();
-    let chunks = make_chunks(&files);
+    let chunks = read_chunks(dir);
     let pairs: Vec<(u64, u64, S, S)> = chunks
         .par_iter()
         .flat_map_iter(|c| {
@@ -1047,7 +1123,8 @@ fn main() {
     }
     pool.build_global().ok();
     let t0 = std::time::Instant::now();
-    let timing = std::env::var("TIMING").is_ok();
+    let timing = true; // a few stderr lines; shows where the time goes in the scorer's log
+    since_exec();
     let lap = |what: &str| {
         if timing {
             eprintln!("{:>8.3}s {what}", t0.elapsed().as_secs_f64());
@@ -1112,18 +1189,11 @@ fn main() {
     const BATCH: usize = 32;
 
     // ------------------------------------------------ links, in parallel with mapping the inputs
-    let ((links, mut names), (ev_files, ck_files)) = rayon::join(
+    let ((links, mut names), (ev_chunks, ck_chunks)) = rayon::join(
         || build_links(&data.join("links")),
-        || {
-            rayon::join(
-                || list_csv(&data.join("events")).par_iter().map(|p| load(p)).collect::<Vec<S>>(),
-                || list_csv(&data.join("clicks")).par_iter().map(|p| load(p)).collect::<Vec<S>>(),
-            )
-        },
+        || rayon::join(|| read_chunks(&data.join("events")), || read_chunks(&data.join("clicks"))),
     );
-    lap("links + mmap");
-    let ev_chunks = make_chunks(&ev_files);
-    let ck_chunks = make_chunks(&ck_files);
+    lap("links + read");
     let ev_groups = groups(ev_chunks.len());
     let ck_groups = groups(ck_chunks.len());
 
@@ -1606,6 +1676,21 @@ fn main() {
     }
     // all output files are closed and flushed; skip freeing gigabytes of memory one by one
     exit_now();
+}
+
+/// Prints how long the process existed before main (loader, runtime start), Linux only.
+fn since_exec() {
+    #[cfg(target_os = "linux")]
+    {
+        let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let up = std::fs::read_to_string("/proc/uptime").unwrap_or_default();
+        let start = st.rsplit(')').next().and_then(|r| r.split_whitespace().nth(19)).and_then(|v| v.parse::<f64>().ok());
+        let up = up.split_whitespace().next().and_then(|v| v.parse::<f64>().ok());
+        if let (Some(s), Some(u)) = (start, up) {
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+            eprintln!("   main at {:.3}s after exec", u - s / hz);
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
