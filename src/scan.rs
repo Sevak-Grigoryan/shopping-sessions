@@ -75,14 +75,19 @@ pub fn scan<'a, const N: usize>(d: &'a [u8], skip_header: bool, mut f: impl FnMu
             s = ends[k] + 1;
         }
         fields[N - 1] = unsafe { d.get_unchecked(s..p) };
-        if qc > 0 {
+        {
+            // branchless, and run for every line: quoting is random per line and per field,
+            // so branches here mispredict a lot
             let mut w = 0u32;
+            let last = d.len() - 1;
             for fl in fields.iter_mut() {
                 let l = fl.len();
-                if l >= 2 && fl[0] == b'"' && fl[l - 1] == b'"' {
-                    *fl = &fl[1..l - 1];
-                    w += 2;
-                }
+                let s0 = fl.as_ptr() as usize - d.as_ptr() as usize;
+                let a = unsafe { *d.get_unchecked(s0.min(last)) };
+                let b = unsafe { *d.get_unchecked((s0 + l).saturating_sub(1).min(last)) };
+                let k = ((l >= 2) & (a == b'"') & (b == b'"')) as usize;
+                *fl = unsafe { d.get_unchecked(s0 + k..s0 + l - k) };
+                w += 2 * k as u32;
             }
             if w != qc {
                 return;
