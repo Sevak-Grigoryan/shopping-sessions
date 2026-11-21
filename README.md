@@ -28,6 +28,20 @@ Measured on a 20M-event set (seed 7), 8 threads, median of 5 interleaved runs in
 
 The output files were checked with polars, pyarrow and DuckDB.
 
+### Rewrite pass (v20)
+
+Scored v19: **1.44 s** on the practice set. v20 attacks per-line cost:
+
+| Change | Why |
+| --- | --- |
+| Branch-free quote stripping in the CSV scanner | scanner 46-52 -> 33-36 ns/line (single core); 79% of lines have a quoted field |
+| User IDs as exact keys: `u` + base 36 (every generator ID) decodes to its 40-bit number via a lookup table; any other ID falls back to a 64-bit hash, with its name in a side table | names are rebuilt from the key, so records carry no string pointers |
+| Event copies 40 -> 32 bytes, surviving events 24 -> 16 bytes, grouped per person as 8-byte `ts << 32 \| price/category` words | less memory traffic in dedup and sessions; per-person sorts are plain `u64` sorts |
+| Link table slots 32 -> 16 bytes (ID strings kept apart, used only while building) | one cache line per lookup |
+
+Correctness: 36/36 fixtures, `MATCH` on the dev answer, identical output to v19 on a 20M set.
+
+
 ## How it works
 
 1. **Input.** All CSVs are memory-mapped and split into ~4 MB chunks on line boundaries, then parsed in parallel.
