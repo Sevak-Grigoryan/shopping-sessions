@@ -9,10 +9,9 @@ memmap2 = "=0.9.5"
 memchr = "=2.7.4"
 rayon = "=1.10.0"
 rustc-hash = "=2.1.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "=0.2.191"
-arrow-array = { version = "=54.2.1", default-features = false }
-arrow-schema = { version = "=54.2.1", default-features = false }
-parquet = { version = "=54.2.1", default-features = false, features = ["arrow"] }
 
 [profile.release]
 opt-level = 3

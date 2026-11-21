@@ -92,7 +92,7 @@ pub fn scan<'a, const N: usize>(d: &'a [u8], skip_header: bool, mut f: impl FnMu
     };
 
     let mut i = 0usize;
-    let mut pad = [0u8; 64];
+    let mut pad: [u8; 64];
     while i < len {
         let (c, nl, q) = unsafe {
             if i + 64 <= len {
