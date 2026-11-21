@@ -6,6 +6,33 @@
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+#[inline(always)]
+unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+    let v = _mm512_loadu_si512(p as *const _);
+    (
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+        _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+    )
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", not(target_feature = "avx512bw")))]
+#[inline(always)]
+unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+    let c = _mm256_set1_epi8(b',' as i8);
+    let n = _mm256_set1_epi8(b'\n' as i8);
+    let q = _mm256_set1_epi8(b'"' as i8);
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let m = |x: __m256i, y: __m256i| {
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, x)) as u32 as u64)
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, y)) as u32 as u64) << 32)
+    };
+    (m(c, c), m(n, n), m(q, q))
+}
+
+#[cfg(not(any(target_feature = "avx2", target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
     let c = _mm_set1_epi8(b',' as i8);
